@@ -11,57 +11,49 @@ from openpyxl.worksheet.worksheet import Worksheet
 import holidays
 from dateutil import parser as date_parser
 
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-
 
 # =========================================================
-# TEMA (Claro / Escuro) - CSS
+# UI - Streamlit (LAYOUT PRETO FIXO)
 # =========================================================
-CSS_LIGHT = """
-<style>
-:root { --bg:#f2f5f9; --text:#222; --card:#ffffff; --accent:#0078d7; --muted:#e6eef8; }
-html, body, [data-testid="stAppViewContainer"] { background: var(--bg) !important; color: var(--text) !important; }
-[data-testid="stHeader"] { background: rgba(0,0,0,0) !important; }
-.block-container { padding-top: 2rem; }
-.card {
-    background: var(--card);
-    border-radius: 14px;
-    padding: 16px;
-    border: 1px solid rgba(0,0,0,0.08);
-}
-.badge {
-    display:inline-block; padding:6px 10px; border-radius:999px;
-    background: var(--muted); color: var(--text); font-weight:600; font-size: 0.9rem;
-}
-.stButton>button { background: var(--accent) !important; border: none !important; }
-.stButton>button:hover { filter: brightness(0.92); }
-</style>
-"""
+st.set_page_config(page_title="Sistema de Escalas", layout="centered")
 
-CSS_DARK = """
+st.markdown("""
 <style>
-:root { --bg:#121212; --text:#eee; --card:#1f1f1f; --accent:#2196f3; --muted:#2c2c2c; }
-html, body, [data-testid="stAppViewContainer"] { background: var(--bg) !important; color: var(--text) !important; }
+html, body, [data-testid="stAppViewContainer"] {
+    background-color: #121212 !important;
+    color: #eeeeee !important;
+}
 [data-testid="stHeader"] { background: rgba(0,0,0,0) !important; }
 .block-container { padding-top: 2rem; }
+
 .card {
-    background: var(--card);
+    background: #1f1f1f;
     border-radius: 14px;
     padding: 16px;
     border: 1px solid rgba(255,255,255,0.12);
 }
-.badge {
-    display:inline-block; padding:6px 10px; border-radius:999px;
-    background: var(--muted); color: var(--text); font-weight:600; font-size: 0.9rem;
-}
-.stButton>button { background: var(--accent) !important; border: none !important; }
-.stButton>button:hover { filter: brightness(0.92); }
-</style>
-"""
 
-def apply_theme(theme_name: str):
-    st.markdown(CSS_DARK if theme_name == "Escuro" else CSS_LIGHT, unsafe_allow_html=True)
+.badge {
+    display:inline-block;
+    padding:6px 10px;
+    border-radius:999px;
+    background:#2c2c2c;
+    color:#ffffff;
+    font-weight:600;
+    font-size:0.9rem;
+}
+
+.stButton>button {
+    background-color: #2196f3 !important;
+    color: white !important;
+    border: none !important;
+}
+
+.stButton>button:hover {
+    background-color: #1769aa !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
 
 # =========================================================
@@ -143,12 +135,7 @@ def month_bounds(year: int, month: int) -> Tuple[dt.date, dt.date]:
     return dt.date(year, month, 1), dt.date(year, month, last)
 
 
-def count_workdays(
-    start: dt.date,
-    end: dt.date,
-    working_days: Set[int],
-    holiday_set: Set[dt.date],
-) -> int:
+def count_workdays(start: dt.date, end: dt.date, working_days: Set[int], holiday_set: Set[dt.date]) -> int:
     if start > end:
         return 0
     cnt = 0
@@ -174,17 +161,13 @@ def parse_sheet_month_year(sheet_name: str) -> Optional[Tuple[int, int]]:
 
 
 def find_header_row_and_map(ws: Worksheet) -> Tuple[int, Dict[str, int]]:
-    """
-    Find header row by scanning first ~50 rows and mapping header text -> column index.
-    Returns (header_row, header_map).
-    """
+    """Find header row by scanning first ~50 rows and mapping header text -> column index."""
     for r in range(1, 51):
         values = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
         if not values:
             continue
-        normalized = []
-        for v in values:
-            normalized.append("" if v is None else str(v).strip().upper())
+
+        normalized = [("" if v is None else str(v).strip().upper()) for v in values]
 
         if "INÍCIO ESCALA NOVA" in normalized and "ESCALA NOVA" in normalized:
             m: Dict[str, int] = {}
@@ -228,11 +211,7 @@ def parse_extra_holidays(text: str) -> Set[dt.date]:
     return out
 
 
-def process_workbook(
-    file_bytes: bytes,
-    sheet_names: Optional[List[str]],
-    extra_holidays: Set[dt.date],
-) -> Tuple[bytes, List[str]]:
+def process_workbook(file_bytes: bytes, sheet_names: Optional[List[str]], extra_holidays: Set[dt.date]) -> Tuple[bytes, List[str]]:
     logs: List[str] = []
     bio = io.BytesIO(file_bytes)
     wb = load_workbook(bio)
@@ -376,9 +355,8 @@ def process_workbook(
 
 
 # =========================================================
-# ABA 2 - WorkTime Manager (Streamlit) + Export PDF/Excel
+# ABA 2 - WorkTime Manager (Streamlit) + Export Excel
 # =========================================================
-
 DIAS_SEMANA = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
 MESES_PT = [
     "01 - Janeiro", "02 - Fevereiro", "03 - Março", "04 - Abril",
@@ -388,10 +366,10 @@ MESES_PT = [
 
 PONTOS_FACULTATIVOS = ["Carnaval", "Cinzas", "Quaresma", "Servidor Público", "Véspera", "observado"]
 
-def is_ponto_facultativo(nome_feriado: str) -> bool:
+def is_ponto_facultativo_wt(nome_feriado: str) -> bool:
     return any(p.lower() in nome_feriado.lower() for p in PONTOS_FACULTATIVOS)
 
-def calcular_dias_trabalhados(mes, folgas_semana, ano, data_ini=None, data_fim=None):
+def calcular_dias_trabalhados_wt(mes, folgas_semana, ano, data_ini=None, data_fim=None):
     total_dias = calendar.monthrange(ano, mes)[1]
     primeiro_dia = 1
     ultimo_dia = total_dias
@@ -404,7 +382,7 @@ def calcular_dias_trabalhados(mes, folgas_semana, ano, data_ini=None, data_fim=N
     feriados = holidays.Brazil(years=ano)
     feriados_do_mes = [
         d.day for d, nome in feriados.items()
-        if d.month == mes and not is_ponto_facultativo(nome)
+        if d.month == mes and not is_ponto_facultativo_wt(nome)
         and primeiro_dia <= d.day <= ultimo_dia
     ]
 
@@ -422,51 +400,11 @@ def calcular_dias_trabalhados(mes, folgas_semana, ano, data_ini=None, data_fim=N
 
     feriados_ano = holidays.Brazil(years=ano)
     detalhes = {d.day: nome for d, nome in feriados_ano.items()
-                if d.month == mes and not is_ponto_facultativo(nome)}
+                if d.month == mes and not is_ponto_facultativo_wt(nome)}
     if data_fim and data_fim.month == mes and data_fim.year == ano:
         detalhes = {dia: nome for dia, nome in detalhes.items() if dia <= data_fim.day}
 
-    return max(dias_trabalhados, 0), feriados_do_mes, detalhes, (primeiro_dia, ultimo_dia)
-
-def make_pdf_worktime(payload: dict) -> bytes:
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    w, h = A4
-
-    x = 50
-    y = h - 60
-
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(x, y, "WorkTime Manager - Relatório")
-    y -= 28
-
-    c.setFont("Helvetica", 11)
-    c.drawString(x, y, f"Mês/Ano: {payload['mes_nome']} / {payload['ano']}")
-    y -= 18
-    c.drawString(x, y, f"Período: {payload['periodo_str']}")
-    y -= 18
-    c.drawString(x, y, f"Dias trabalhados: {payload['dias_trabalhados']}")
-    y -= 18
-    c.drawString(x, y, f"Folgas semanais: {payload['folgas_str']}")
-    y -= 24
-
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(x, y, "Feriados considerados (não ponto facultativo):")
-    y -= 18
-
-    c.setFont("Helvetica", 10)
-    lines = payload["feriados_str"].split("\n") if payload["feriados_str"] else ["Nenhum"]
-    for line in lines:
-        if y < 60:
-            c.showPage()
-            y = h - 60
-            c.setFont("Helvetica", 10)
-        c.drawString(x, y, line)
-        y -= 14
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
+    return max(dias_trabalhados, 0), detalhes, (primeiro_dia, ultimo_dia)
 
 def make_excel_worktime(payload: dict) -> bytes:
     from openpyxl import Workbook
@@ -477,13 +415,10 @@ def make_excel_worktime(payload: dict) -> bytes:
     ws["A1"] = "WorkTime Manager - Resultado"
     ws["A3"] = "Mês/Ano"
     ws["B3"] = f"{payload['mes_nome']} / {payload['ano']}"
-
     ws["A4"] = "Período"
     ws["B4"] = payload["periodo_str"]
-
     ws["A5"] = "Dias trabalhados"
     ws["B5"] = payload["dias_trabalhados"]
-
     ws["A6"] = "Folgas semanais"
     ws["B6"] = payload["folgas_str"]
 
@@ -502,33 +437,16 @@ def make_excel_worktime(payload: dict) -> bytes:
 
 
 # =========================================================
-# UI - Streamlit
+# APP
 # =========================================================
-st.set_page_config(page_title="Sistema de Escalas", layout="centered")
-
-if "tema" not in st.session_state:
-    st.session_state["tema"] = "Claro"
-
-st.sidebar.title("⚙️ Configurações")
-st.session_state["tema"] = st.sidebar.radio(
-    "Tema",
-    ["Claro", "Escuro"],
-    index=0 if st.session_state["tema"] == "Claro" else 1
-)
-apply_theme(st.session_state["tema"])
-
 st.title("Sistema de Escalas")
-st.caption("Aba 1: Atualiza planilha de escala | Aba 2: WorkTime Manager (dias trabalhados + exportação PDF/Excel)")
+st.caption("Aba 1: Atualiza planilha de escala | Aba 2: WorkTime Manager (dias trabalhados + exportação Excel)")
 
 aba1, aba2 = st.tabs(["Atualizar Escala (Excel)", "WorkTime Manager"])
 
 
-# ----------------------------
-# ABA 1
-# ----------------------------
 with aba1:
     st.subheader("Atualizar planilha de alteração de escala")
-    st.caption("Faça upload do .xlsx, clique em **ATUALIZAR PLANILHA** e baixe o arquivo atualizado (mesma formatação, só valores).")
 
     uploaded = st.file_uploader("Envie sua planilha (.xlsx)", type=["xlsx"], key="uploader_excel")
 
@@ -541,7 +459,6 @@ with aba1:
     )
 
     process_all_sheets = st.checkbox("Processar todas as abas no formato MM.AAAA", value=True, key="process_all")
-
     selected_sheets = None
     sheetnames = None
 
@@ -593,32 +510,14 @@ with aba1:
             key="download_updated"
         )
 
-    st.divider()
-    st.markdown(
-        """
-**Como funciona**
-- Desconta feriados nacionais do Brasil automaticamente (biblioteca `holidays`).
-- Você pode adicionar feriados extras no campo acima (ex.: municipal).
-- Mantém formatação: o app só escreve valores nas colunas de resultado.
-"""
-    )
 
-
-# ----------------------------
-# ABA 2
-# ----------------------------
 with aba2:
     st.subheader("📅 WorkTime Manager - Dias Trabalhados")
 
     ano = dt.datetime.now().year
-
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        mes_label = st.selectbox("Selecione o mês:", MESES_PT, index=dt.datetime.now().month - 1, key="mes_wt")
-        mes = int(mes_label.split(" - ")[0])
-        nome_mes = mes_label.split(" - ")[1]
-    with col2:
-        st.markdown(f"<span class='badge'>Ano: {ano}</span>", unsafe_allow_html=True)
+    mes_label = st.selectbox("Selecione o mês:", MESES_PT, index=dt.datetime.now().month - 1, key="mes_wt")
+    mes = int(mes_label.split(" - ")[0])
+    nome_mes = mes_label.split(" - ")[1]
 
     usar_periodo = st.checkbox("Data de Entrada e Saída", value=False, key="periodo_wt")
 
@@ -639,9 +538,7 @@ with aba2:
             folgas_semana[i] = st.checkbox(dia, value=False, key=f"folga_wt_{i}")
 
     if st.button("Calcular Dias Trabalhados", type="primary", key="btn_calc_wt"):
-        dias, feriados_dias, detalhes, (p_ini, p_fim) = calcular_dias_trabalhados(
-            mes, folgas_semana, ano, data_ini, data_fim
-        )
+        dias, detalhes, (p_ini, p_fim) = calcular_dias_trabalhados_wt(mes, folgas_semana, ano, data_ini, data_fim)
 
         periodo_str = f"{p_ini:02d}/{mes:02d}/{ano} até {p_fim:02d}/{mes:02d}/{ano}"
         folgas_str = ", ".join([DIAS_SEMANA[i] for i, v in enumerate(folgas_semana) if v]) or "Nenhuma"
@@ -679,24 +576,11 @@ with aba2:
 
     if "worktime_payload" in st.session_state:
         payload = st.session_state["worktime_payload"]
-        colA, colB = st.columns(2)
-
-        with colA:
-            pdf_bytes = make_pdf_worktime(payload)
-            st.download_button(
-                "📄 Baixar PDF",
-                data=pdf_bytes,
-                file_name=f"WorkTime_{payload['mes_nome']}_{payload['ano']}.pdf",
-                mime="application/pdf",
-                key="download_pdf_wt"
-            )
-
-        with colB:
-            xlsx_bytes = make_excel_worktime(payload)
-            st.download_button(
-                "📊 Baixar Excel",
-                data=xlsx_bytes,
-                file_name=f"WorkTime_{payload['mes_nome']}_{payload['ano']}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="download_xlsx_wt"
-            )
+        xlsx_bytes = make_excel_worktime(payload)
+        st.download_button(
+            "📊 Baixar Excel do Resultado",
+            data=xlsx_bytes,
+            file_name=f"WorkTime_{payload['mes_nome']}_{payload['ano']}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_xlsx_wt"
+        )
