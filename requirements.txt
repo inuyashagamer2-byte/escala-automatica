@@ -2,3 +2,4 @@ streamlit==1.41.1
 openpyxl==3.1.5
 holidays==0.61
 python-dateutil==2.9.0.post0
+reportlab==4.2.5
