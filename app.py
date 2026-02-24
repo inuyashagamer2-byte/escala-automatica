@@ -29,6 +29,10 @@ PT_DOW = {
 
 DOW_TOKENS_RE = re.compile(r"(SEG|TER|QUA|QUI|SEX|SAB|SÁB|DOM)", re.IGNORECASE)
 
+# Regex to detect month-year from column headers like "DIAS ÚTEIS 01.2026 (ESCALA ANTIGA)"
+MONTHYEAR_RE = re.compile(r"(\d{1,2})\.(\d{4})")
+
+
 @dataclass
 class RowResult:
     ok: bool
@@ -45,7 +49,6 @@ def safe_parse_date(value) -> Optional[dt.date]:
         return value
     s = str(value).strip()
     try:
-        # dayfirst=True to match BR format commonly
         return date_parser.parse(s, dayfirst=True).date()
     except Exception:
         return None
@@ -67,18 +70,13 @@ def parse_schedule_days(text: str) -> Optional[Set[int]]:
     if not tokens:
         return None
 
-    # Normalize
     tok = [t.upper() for t in tokens]
     tok = ["SAB" if t == "SÁB" else t for t in tok]
 
-    # If contains "FOLGA" => days listed are off-days
     if "FOLGA" in s:
         off = {PT_DOW[t] for t in tok if t in PT_DOW}
         return set(range(7)) - off
 
-    # Handle ranges like "SEG A SEX"
-    # We look for pattern "<DAY> A <DAY>" by using first two tokens if ' A ' present.
-    # (Works for most texts in your sheet: "SEG A SEX", etc.)
     if " A " in s and len(tok) >= 2:
         a = PT_DOW.get(tok[0])
         b = PT_DOW.get(tok[1])
@@ -86,10 +84,8 @@ def parse_schedule_days(text: str) -> Optional[Set[int]]:
             return None
         if a <= b:
             return set(range(a, b + 1))
-        # wrap around (e.g., "SEX A TER")
         return set(list(range(a, 7)) + list(range(0, b + 1)))
 
-    # Otherwise treat as explicit list of days
     days = {PT_DOW[t] for t in tok if t in PT_DOW}
     return days if days else None
 
@@ -97,6 +93,17 @@ def parse_schedule_days(text: str) -> Optional[Set[int]]:
 def month_bounds(year: int, month: int) -> Tuple[dt.date, dt.date]:
     last = calendar.monthrange(year, month)[1]
     return dt.date(year, month, 1), dt.date(year, month, last)
+
+
+def month_start_from_day(year: int, month: int, start_day: int) -> dt.date:
+    """
+    Use ONLY the day number from 'INÍCIO ESCALA NOVA' as the start day for each month/year.
+    If start_day doesn't exist in that month, returns a date after month end (so count becomes 0).
+    """
+    last = calendar.monthrange(year, month)[1]
+    if start_day > last:
+        return dt.date(year, month, last) + dt.timedelta(days=1)
+    return dt.date(year, month, start_day)
 
 
 def count_workdays(
@@ -117,24 +124,9 @@ def count_workdays(
     return cnt
 
 
-def parse_sheet_month_year(sheet_name: str) -> Optional[Tuple[int, int]]:
-    """
-    Expect sheet like '01.2026' -> (2026, 1).
-    """
-    m = re.match(r"^\s*(\d{1,2})\.(\d{4})\s*$", str(sheet_name))
-    if not m:
-        return None
-    month = int(m.group(1))
-    year = int(m.group(2))
-    if not (1 <= month <= 12):
-        return None
-    return year, month
-
-
 def find_header_row_and_map(ws: Worksheet) -> Tuple[int, Dict[str, int]]:
     """
     Find header row by scanning first ~50 rows and mapping header text -> column index.
-    Returns (header_row, header_map).
     Header_map keys are normalized (upper, strip).
     """
     for r in range(1, 51):
@@ -147,44 +139,32 @@ def find_header_row_and_map(ws: Worksheet) -> Tuple[int, Dict[str, int]]:
                 normalized.append("")
             else:
                 normalized.append(str(v).strip().upper())
-        # Heuristic: if contains required headers
+
         if "INÍCIO ESCALA NOVA" in normalized and "ESCALA NOVA" in normalized:
-            # build map
             m: Dict[str, int] = {}
             for idx, name in enumerate(normalized, start=1):
                 if name:
                     m[name] = idx
             return r, m
+
     raise ValueError("Não encontrei a linha de cabeçalho (preciso de 'INÍCIO ESCALA NOVA' e 'ESCALA NOVA').")
 
 
-def ensure_column(ws: Worksheet, header_row: int, header_map: Dict[str, int], header_name: str) -> int:
-    """
-    Ensure a column with header header_name exists; if not, create at end.
-    Returns column index.
-    """
-    key = header_name.strip().upper()
-    if key in header_map:
-        return header_map[key]
-
-    new_col = ws.max_column + 1
-    ws.cell(row=header_row, column=new_col).value = header_name
-    header_map[key] = new_col
-    return new_col
+def get_column_if_exists(header_map: Dict[str, int], header_name: str) -> Optional[int]:
+    """Return column index if exists; do NOT create new columns."""
+    return header_map.get(header_name.strip().upper())
 
 
 def build_brazil_holidays(years: Set[int]) -> Set[dt.date]:
-    """
-    National Brazil holidays for given years using python-holidays.
-    """
+    """National Brazil holidays for given years using python-holidays."""
+    if not years:
+        return set()
     br = holidays.Brazil(years=years)
     return {d for d in br.keys()}
 
 
 def parse_extra_holidays(text: str) -> Set[dt.date]:
-    """
-    Parse user-entered holidays: lines with dates like 25/01/2026, 2026-01-25, etc.
-    """
+    """Parse user-entered holidays (1 per line)."""
     out: Set[dt.date] = set()
     if not text:
         return out
@@ -195,9 +175,51 @@ def parse_extra_holidays(text: str) -> Set[dt.date]:
         try:
             out.add(date_parser.parse(s, dayfirst=True).date())
         except Exception:
-            # ignore invalid lines
             pass
     return out
+
+
+def extract_month_year_from_header(header: str) -> Optional[Tuple[int, int]]:
+    """
+    Extract (year, month) from something that contains 'MM.AAAA'.
+    Returns (year, month).
+    """
+    if not header:
+        return None
+    m = MONTHYEAR_RE.search(str(header))
+    if not m:
+        return None
+    month = int(m.group(1))
+    year = int(m.group(2))
+    if 1 <= month <= 12:
+        return year, month
+    return None
+
+
+def detect_months_from_existing_output_columns(header_map: Dict[str, int]) -> List[Tuple[int, int]]:
+    """
+    Detect which months exist in the Excel by looking at existing output columns:
+      - DIAS ÚTEIS MM.AAAA (ESCALA ANTIGA)
+      - DIAS ÚTEIS MM.AAAA (ESCALA NOVA)
+      - DIAS DEVIDOS MM.AAAA
+    We will calculate ONLY for months that already appear in at least one of these columns.
+    """
+    months: Set[Tuple[int, int]] = set()
+    for h in header_map.keys():
+        # Only look at columns that match outputs or the old scale column pattern
+        if ("DIAS ÚTEIS" in h) or ("DIAS DEVIDOS" in h):
+            ym = extract_month_year_from_header(h)
+            if ym:
+                months.add(ym)
+    return sorted(months, key=lambda x: (x[0], x[1]))
+
+
+def find_old_scale_column_for_month(header_map: Dict[str, int], year: int, month: int) -> Optional[int]:
+    """
+    Old scale column is expected to be: 'ESCALA MM.AAAA'
+    """
+    old_scale_header = f"ESCALA {month:02d}.{year}".upper()
+    return header_map.get(old_scale_header)
 
 
 # ----------------------------
@@ -208,45 +230,25 @@ def process_workbook(
     file_bytes: bytes,
     sheet_names: Optional[List[str]],
     extra_holidays: Set[dt.date],
-    backup_mode: bool = False,  # not used in web; kept for future
 ) -> Tuple[bytes, List[str]]:
     """
     Load xlsx from bytes, update selected sheets, return updated file bytes and logs.
+
+    Key changes requested:
+    - Use ONLY the DAY from 'INÍCIO ESCALA NOVA' for start day in each month (ignore its month/year).
+    - Calculate ONLY for columns that already exist in the Excel (do not create new columns).
     """
     logs: List[str] = []
     bio = io.BytesIO(file_bytes)
     wb = load_workbook(bio)
     target_sheets = sheet_names or wb.sheetnames
 
-    # collect years for holiday generation from target sheets
-    years: Set[int] = set()
-    sheet_ym: Dict[str, Tuple[int, int]] = {}
-
-    for sname in target_sheets:
-        ym = parse_sheet_month_year(sname)
-        if ym:
-            y, m = ym
-            years.add(y)
-            years.add(y)  # explicit
-            sheet_ym[sname] = (y, m)
-
-    # also include years from extra holidays
-    for d in extra_holidays:
-        years.add(d.year)
-
-    br_holidays = build_brazil_holidays(years) if years else set()
-    holiday_set = set(br_holidays) | set(extra_holidays)
-
     updated_any = False
 
     for sname in target_sheets:
         if sname not in wb.sheetnames:
             continue
-        if sname not in sheet_ym:
-            logs.append(f"[IGNORADO] Aba '{sname}' não está no formato MM.AAAA (ex: 01.2026).")
-            continue
 
-        year, month_sheet = sheet_ym[sname]
         ws = wb[sname]
 
         try:
@@ -255,117 +257,121 @@ def process_workbook(
             logs.append(f"[ERRO] Aba '{sname}': {e}")
             continue
 
-        # Determine old scale column for this sheet (e.g. "ESCALA 01.2026")
-        old_scale_header = f"ESCALA {month_sheet:02d}.{year}"
-        old_key = old_scale_header.upper()
-
-        if old_key not in header_map:
-            logs.append(f"[ERRO] Aba '{sname}': não achei a coluna '{old_scale_header}'.")
+        # Detect which months we should calculate based on EXISTING output columns
+        months_to_calc = detect_months_from_existing_output_columns(header_map)
+        if not months_to_calc:
+            logs.append(f"[AVISO] Aba '{sname}': não encontrei colunas de saída (DIAS ÚTEIS/DIAS DEVIDOS) com MM.AAAA. Nada a calcular.")
             continue
 
-        col_old = header_map[old_key]
+        # We need ESCALA NOVA and INÍCIO ESCALA NOVA
+        if "ESCALA NOVA" not in header_map or "INÍCIO ESCALA NOVA" not in header_map:
+            logs.append(f"[ERRO] Aba '{sname}': faltam colunas obrigatórias 'ESCALA NOVA' e/ou 'INÍCIO ESCALA NOVA'.")
+            continue
+
         col_new = header_map["ESCALA NOVA"]
         col_start = header_map["INÍCIO ESCALA NOVA"]
 
-        # Ensure output columns exist
-        # For your use-case we always calculate Jan/Feb 2026 columns, but you can expand later.
-        # We'll do: month_sheet and month_sheet+1 as "01" and "02" relative to sheet year.
-        # If sheet is 01.2026 -> calc 01.2026 and 02.2026.
-        m1 = month_sheet
-        y1 = year
-        if m1 == 12:
-            m2, y2 = 1, year + 1
-        else:
-            m2, y2 = m1 + 1, year
+        # Collect years for holidays for this sheet
+        years_needed = {y for (y, m) in months_to_calc}
+        years_needed |= {d.year for d in extra_holidays}
+        holiday_set = build_brazil_holidays(years_needed) | set(extra_holidays)
 
-        # Column headers to fill
-        h_old_1 = f"DIAS ÚTEIS {m1:02d}.{y1} (ESCALA ANTIGA)"
-        h_new_1 = f"DIAS ÚTEIS {m1:02d}.{y1} (ESCALA NOVA)"
-        h_due_1 = f"DIAS DEVIDOS {m1:02d}.{y1}"
+        # Pre-map output columns that exist (so we don't create anything)
+        out_cols: Dict[Tuple[int, int], Dict[str, Optional[int]]] = {}
+        missing_cols_msgs: List[str] = []
 
-        h_old_2 = f"DIAS ÚTEIS {m2:02d}.{y2} (ESCALA ANTIGA)"
-        h_new_2 = f"DIAS ÚTEIS {m2:02d}.{y2} (ESCALA NOVA)"
-        h_due_2 = f"DIAS DEVIDOS {m2:02d}.{y2}"
+        for (yy, mm) in months_to_calc:
+            h_old = f"DIAS ÚTEIS {mm:02d}.{yy} (ESCALA ANTIGA)"
+            h_new = f"DIAS ÚTEIS {mm:02d}.{yy} (ESCALA NOVA)"
+            h_due = f"DIAS DEVIDOS {mm:02d}.{yy}"
 
-        h_total = "TOTAL DIAS DEVIDOS"
+            c_old = get_column_if_exists(header_map, h_old)
+            c_new = get_column_if_exists(header_map, h_new)
+            c_due = get_column_if_exists(header_map, h_due)
 
-        c_old_1 = ensure_column(ws, header_row, header_map, h_old_1)
-        c_new_1 = ensure_column(ws, header_row, header_map, h_new_1)
-        c_due_1 = ensure_column(ws, header_row, header_map, h_due_1)
+            out_cols[(yy, mm)] = {"old": c_old, "new": c_new, "due": c_due}
 
-        c_old_2 = ensure_column(ws, header_row, header_map, h_old_2)
-        c_new_2 = ensure_column(ws, header_row, header_map, h_new_2)
-        c_due_2 = ensure_column(ws, header_row, header_map, h_due_2)
+            # log missing (not created)
+            miss = []
+            if c_old is None: miss.append(h_old)
+            if c_new is None: miss.append(h_new)
+            if c_due is None: miss.append(h_due)
+            if miss:
+                missing_cols_msgs.append(f"{mm:02d}.{yy}: " + " | ".join(miss))
 
-        c_total = ensure_column(ws, header_row, header_map, h_total)
+        # TOTAL DIAS DEVIDOS (optional) - only write if exists
+        c_total = get_column_if_exists(header_map, "TOTAL DIAS DEVIDOS")
 
-        # Iterate rows until blank line (or max_row)
+        if missing_cols_msgs:
+            logs.append(f"[INFO] Aba '{sname}': algumas colunas de saída não existem e NÃO serão criadas. ({'; '.join(missing_cols_msgs)})")
+
         processed = 0
         errors = 0
 
         last_row = ws.max_row
         for r in range(header_row + 1, last_row + 1):
-            # if row seems empty, skip (but don't break aggressively)
-            v_old = ws.cell(row=r, column=col_old).value
             v_new = ws.cell(row=r, column=col_new).value
             v_start = ws.cell(row=r, column=col_start).value
 
-            if v_old is None and v_new is None and v_start is None:
+            # Skip fully empty lines
+            if v_new is None and v_start is None:
                 continue
 
             start_date = safe_parse_date(v_start)
             if start_date is None:
-                # If no start date, we can't compute (skip with error)
                 errors += 1
                 continue
 
-            days_old = parse_schedule_days(v_old)
+            start_day = start_date.day  # <-- ONLY DAY is used
+
             days_new = parse_schedule_days(v_new)
-
-            if days_old is None or days_new is None:
+            if days_new is None:
                 errors += 1
                 continue
 
-            # month 1
-            m1_start, m1_end = month_bounds(y1, m1)
-            if start_date > m1_end:
-                old_1 = new_1 = due_1 = 0
-            else:
-                calc_start = max(start_date, m1_start)
-                old_1 = count_workdays(calc_start, m1_end, days_old, holiday_set)
-                new_1 = count_workdays(calc_start, m1_end, days_new, holiday_set)
-                due_1 = old_1 - new_1
+            total_due = 0
 
-            # month 2
-            m2_start, m2_end = month_bounds(y2, m2)
-            if start_date > m2_end:
-                old_2 = new_2 = due_2 = 0
-            else:
-                calc_start = max(start_date, m2_start)
-                old_2 = count_workdays(calc_start, m2_end, days_old, holiday_set)
-                new_2 = count_workdays(calc_start, m2_end, days_new, holiday_set)
-                due_2 = old_2 - new_2
+            for (yy, mm) in months_to_calc:
+                # Find old scale column for THIS month (ESCALA MM.AAAA) — must exist to compute old vs new
+                col_old = find_old_scale_column_for_month(header_map, yy, mm)
+                if col_old is None:
+                    # if there's no old scale column for this month, we cannot compare; skip this month
+                    continue
 
-            total = due_1 + due_2
+                v_old = ws.cell(row=r, column=col_old).value
+                days_old = parse_schedule_days(v_old)
+                if days_old is None:
+                    # can't compute for this month
+                    continue
 
-            # Write values only (no style changes)
-            ws.cell(row=r, column=c_old_1).value = old_1
-            ws.cell(row=r, column=c_new_1).value = new_1
-            ws.cell(row=r, column=c_due_1).value = due_1
+                m_start, m_end = month_bounds(yy, mm)
+                calc_start = month_start_from_day(yy, mm, start_day)  # <-- day inside month/year from headers
 
-            ws.cell(row=r, column=c_old_2).value = old_2
-            ws.cell(row=r, column=c_new_2).value = new_2
-            ws.cell(row=r, column=c_due_2).value = due_2
+                old_cnt = count_workdays(calc_start, m_end, days_old, holiday_set)
+                new_cnt = count_workdays(calc_start, m_end, days_new, holiday_set)
+                due = old_cnt - new_cnt
 
-            ws.cell(row=r, column=c_total).value = total
+                total_due += due
+
+                # write only if those columns exist
+                cols = out_cols.get((yy, mm), {})
+                if cols.get("old") is not None:
+                    ws.cell(row=r, column=cols["old"]).value = old_cnt
+                if cols.get("new") is not None:
+                    ws.cell(row=r, column=cols["new"]).value = new_cnt
+                if cols.get("due") is not None:
+                    ws.cell(row=r, column=cols["due"]).value = due
+
+            if c_total is not None:
+                ws.cell(row=r, column=c_total).value = total_due
 
             processed += 1
 
-        logs.append(f"[OK] Aba '{sname}': {processed} linhas atualizadas, {errors} linhas com erro (data/escala inválida).")
+        logs.append(f"[OK] Aba '{sname}': {processed} linhas processadas, {errors} linhas com erro (data/escala inválida).")
         updated_any = True
 
     if not updated_any:
-        logs.append("[AVISO] Nenhuma aba foi atualizada. Verifique se as abas estão no formato MM.AAAA (ex: 01.2026) e se os cabeçalhos existem.")
+        logs.append("[AVISO] Nenhuma aba foi atualizada. Verifique se os cabeçalhos existem e se há colunas de saída (DIAS ÚTEIS/DIAS DEVIDOS) com MM.AAAA.")
 
     out = io.BytesIO()
     wb.save(out)
@@ -390,11 +396,10 @@ extra_holidays_text = st.text_area(
     height=120,
 )
 
-process_all_sheets = st.checkbox("Processar todas as abas no formato MM.AAAA", value=True)
+process_all_sheets = st.checkbox("Processar TODAS as abas (recomendado)", value=True)
 
 selected_sheets = None
 if uploaded is not None:
-    # Load workbook just to list sheets (safe, no write)
     try:
         wb_preview = load_workbook(io.BytesIO(uploaded.getvalue()), read_only=True)
         sheetnames = wb_preview.sheetnames
@@ -407,7 +412,7 @@ if uploaded is not None:
         selected_sheets = st.multiselect(
             "Selecione as abas para processar",
             options=sheetnames,
-            default=[s for s in sheetnames if re.match(r"^\d{1,2}\.\d{4}$", s.strip())],
+            default=sheetnames[:1],
         )
 
 btn = st.button("ATUALIZAR PLANILHA", type="primary", disabled=(uploaded is None))
@@ -427,12 +432,11 @@ if btn and uploaded is not None:
             st.error(line)
         elif line.startswith("[AVISO]"):
             st.warning(line)
-        elif line.startswith("[IGNORADO]"):
+        elif line.startswith("[INFO]"):
             st.info(line)
         else:
             st.success(line)
 
-    # Download updated file with same name (best possible on web)
     filename = uploaded.name
     st.download_button(
         "Baixar planilha atualizada",
@@ -444,9 +448,10 @@ if btn and uploaded is not None:
 st.divider()
 st.markdown(
     """
-**Como funciona**
-- Desconta feriados nacionais do Brasil automaticamente (biblioteca `holidays`).
-- Você pode adicionar feriados extras no campo acima (ex.: municipal).
-- Mantém formatação: o app só escreve valores nas colunas de resultado.
+**Como funciona (atualizado)**
+- Usa **somente o DIA** do campo **INÍCIO ESCALA NOVA** (ignora mês/ano do início).
+- O mês/ano vem das colunas existentes (ex.: `DIAS ÚTEIS 02.2026 ...`).
+- **Não cria colunas novas**: só preenche as que já existem no seu Excel.
+- Desconta feriados nacionais do Brasil automaticamente (biblioteca `holidays`) + feriados extras opcionais.
 """
 )
